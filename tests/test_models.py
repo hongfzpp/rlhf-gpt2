@@ -13,6 +13,7 @@ import numpy as np
 from configs.model_config import ModelConfig, TINY_CONFIG
 from models.attention import CausalSelfAttention
 from models.transformer_block import TransformerBlock
+from models.gpt2 import GPT2LMHeadModel
 
 
 # Use a tiny config for fast tests
@@ -124,3 +125,81 @@ class TestTransformerBlock:
         params = block.init(rng, x, mask=mask)
         y = block.apply(params, x, mask=mask, deterministic=True)
         assert y.shape == (2, 8, 64)
+
+
+# ---------------------------------------------------------------------------
+# Component: GPT-2 Language Model
+# ---------------------------------------------------------------------------
+
+class TestGPT2LMHeadModel:
+    """Tests for GPT2LMHeadModel."""
+
+    def test_output_shape(self):
+        """Output logits should have shape (B, T, vocab_size)."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        input_ids = jnp.ones((2, 16), dtype=jnp.int32)
+
+        params = model.init(rng, input_ids)
+        logits = model.apply(params, input_ids, deterministic=True)
+        assert logits.shape == (2, 16, TEST_CONFIG.vocab_size), (
+            f"Expected (2, 16, {TEST_CONFIG.vocab_size}), got {logits.shape}"
+        )
+
+    def test_with_attention_mask(self):
+        """Should work with a padding attention mask."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        input_ids = jnp.ones((2, 16), dtype=jnp.int32)
+        attention_mask = jnp.ones((2, 16), dtype=jnp.float32)
+        attention_mask = attention_mask.at[0, 12:].set(0.0)  # pad the first sequence
+
+        params = model.init(rng, input_ids)
+        logits = model.apply(params, input_ids, attention_mask=attention_mask, deterministic=True)
+        assert logits.shape == (2, 16, TEST_CONFIG.vocab_size)
+
+    def test_parameter_count(self):
+        """Model should have a reasonable number of parameters."""
+        from utils.jax_utils import count_params
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        input_ids = jnp.ones((1, 8), dtype=jnp.int32)
+        params = model.init(rng, input_ids)
+
+        n_params = count_params(params)
+        print(f"Test model parameters: {n_params:,}")
+        assert n_params > 0, "Model should have parameters"
+        # For tiny config: roughly vocab_size*d_model + n_layers * block_params
+        assert n_params < 10_000_000, "Tiny model should be < 10M params"
+
+    def test_causal_property(self):
+        """Logits at position i should only depend on tokens 0..i."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+
+        input_ids = jax.random.randint(rng, (1, 16), 0, TEST_CONFIG.vocab_size)
+        params = model.init(rng, input_ids)
+
+        logits1 = model.apply(params, input_ids, deterministic=True)
+
+        # Change the last token
+        modified = input_ids.at[:, -1].set(0)
+        logits2 = model.apply(params, modified, deterministic=True)
+
+        # All positions except the last should produce identical logits
+        np.testing.assert_allclose(
+            logits1[:, :-1, :], logits2[:, :-1, :], atol=1e-4,
+            err_msg="Causal property violated"
+        )
+
+    def test_get_hidden_states(self):
+        """get_hidden_states should return (B, T, d_model)."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        input_ids = jnp.ones((2, 16), dtype=jnp.int32)
+
+        params = model.init(rng, input_ids)
+        hidden = model.apply(params, input_ids, deterministic=True, method=model.get_hidden_states)
+        assert hidden.shape == (2, 16, TEST_CONFIG.d_model), (
+            f"Expected (2, 16, {TEST_CONFIG.d_model}), got {hidden.shape}"
+        )
