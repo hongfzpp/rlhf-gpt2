@@ -19,3 +19,16 @@ class ModelConfig:
     dropout_rate: float = 0.1     # Dropout rate (used during training)
     dtype: str = "float32"        # Default dtype; Metal does NOT support bfloat16
 
+
+# Pre-defined model sizes for experimentation
+TINY_CONFIG = ModelConfig(
+    n_layers=2, n_heads=2, d_model=128, d_ff=512, max_seq_len=128,
+)
+
+SMALL_CONFIG = ModelConfig(
+    n_layers=4, n_heads=4, d_model=256, d_ff=1024, max_seq_len=256,
+)
+
+MEDIUM_CONFIG = ModelConfig(
+    n_layers=6, n_heads=8, d_model=512, d_ff=2048, max_seq_len=512,
+)
