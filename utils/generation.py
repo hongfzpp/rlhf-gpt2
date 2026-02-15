@@ -1,9 +1,8 @@
 """Autoregressive text generation utilities.
 
 Provides top-k and nucleus (top-p) sampling for generating responses
-during PPO rollouts and evaluation. Uses a Python loop over timesteps
-for clarity; a production implementation would use jax.lax.while_loop
-for full XLA compilation.
+during PPO rollouts and evaluation. Uses jax.lax.while_loop for full
+XLA compilation with early stopping on EOS.
 """
 
 from __future__ import annotations
@@ -90,45 +89,75 @@ def generate(
 ) -> jax.Array:
     """Autoregressive generation using top-k sampling.
 
-    This is a simple Python-loop implementation for clarity. In production,
-    you'd use jax.lax.while_loop for full XLA compilation.
+    Uses jax.lax.while_loop so the entire generation loop is compiled
+    into a single XLA program (no Python-level per-step overhead).
 
     Args:
         apply_fn: Model apply function: (params, input_ids) -> logits.
                   logits should have shape (batch_size, seq_len, vocab_size).
+                  Must use causal masking so future pad positions don't
+                  affect logits at earlier positions.
         params: Model parameters pytree.
         input_ids: Initial token IDs, shape (batch_size, prompt_len).
         rng: PRNG key.
         max_new_tokens: Maximum number of tokens to generate.
         temperature: Sampling temperature.
         top_k: Number of top tokens for top-k sampling.
-        eos_token_id: If set, stop generation when EOS is produced.
+        eos_token_id: If set, stop generation when all sequences produce EOS.
 
     Returns:
-        Generated token IDs, shape (batch_size, prompt_len + num_generated).
+        Generated token IDs, shape (batch_size, prompt_len + max_new_tokens).
+        Positions after EOS are padded with 0.
     """
-    batch_size = input_ids.shape[0]
-    generated = input_ids
+    batch_size, prompt_len = input_ids.shape
+    total_len = prompt_len + max_new_tokens
 
-    for _ in range(max_new_tokens):
-        # Forward pass — get logits for the last position
-        logits = apply_fn(params, generated)         # (batch, seq, vocab)
-        next_logits = logits[:, -1, :]               # (batch, vocab)
+    # Pre-allocate fixed-size output buffer (required by XLA)
+    tokens = jnp.zeros((batch_size, total_len), dtype=jnp.int32)
+    tokens = tokens.at[:, :prompt_len].set(input_ids)
 
-        # Sample next token for each sequence in the batch
+    # Per-sequence finished flag
+    finished = jnp.zeros(batch_size, dtype=jnp.bool_)
+
+    # Sentinel that never matches any real token when eos_token_id is None
+    eos_id = jnp.array(
+        eos_token_id if eos_token_id is not None else -1, dtype=jnp.int32
+    )
+
+    # Carry: (step, tokens, rng, finished)
+    init_carry = (jnp.array(0, dtype=jnp.int32), tokens, rng, finished)
+
+    def cond_fn(carry):
+        step, _, _, finished = carry
+        return (step < max_new_tokens) & (~jnp.all(finished))
+
+    def body_fn(carry):
+        step, tokens, rng, finished = carry
+
+        # Forward pass over the full buffer; causal mask ensures that
+        # logits at position (cur_pos - 1) only depend on tokens 0..cur_pos-1
+        logits = apply_fn(params, tokens)           # (batch, total_len, vocab)
+        cur_pos = prompt_len + step                  # position to write
+        next_logits = logits[:, cur_pos - 1, :]      # (batch, vocab)
+
+        # Sample next tokens
         rng, step_rng = jax.random.split(rng)
         step_rngs = jax.random.split(step_rng, batch_size)
 
         next_tokens = jax.vmap(
             lambda lg, r: top_k_sampling(lg, r, k=top_k, temperature=temperature)
-        )(next_logits, step_rngs)
+        )(next_logits, step_rngs)                    # (batch,)
 
-        next_tokens = next_tokens[:, None]           # (batch, 1)
-        generated = jnp.concatenate([generated, next_tokens], axis=1)
+        # Pad finished sequences with 0 instead of continuing to generate
+        next_tokens = jnp.where(finished, 0, next_tokens)
+        tokens = tokens.at[:, cur_pos].set(next_tokens)
 
-        # Check for EOS (simple — stops all sequences when any produces EOS)
-        if eos_token_id is not None:
-            if jnp.any(next_tokens == eos_token_id):
-                break
+        # Update finished flags
+        newly_finished = next_tokens == eos_id
+        finished = finished | newly_finished
 
-    return generated
+        return (step + 1, tokens, rng, finished)
+
+    _, tokens, _, _ = jax.lax.while_loop(cond_fn, body_fn, init_carry)
+
+    return tokens
