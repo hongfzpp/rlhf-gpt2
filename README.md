@@ -18,3 +18,4 @@ Stage 2: Reward Model Training
 *   02/13/2026: Set up the backbone model (GPT2)
 *   02/14/2026: Finished PPO algorithms
 *   02/15/2026: Finished GRPO
+*   02/16/2026: Finished DPO
