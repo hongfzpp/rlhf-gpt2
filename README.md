@@ -19,3 +19,4 @@ Stage 2: Reward Model Training
 *   02/14/2026: Finished PPO algorithms
 *   02/15/2026: Finished GRPO
 *   02/16/2026: Finished DPO
+*   02/18/2026: Added KV-cache
