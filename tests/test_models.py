@@ -83,6 +83,123 @@ class TestCausalSelfAttention:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for KV-cache tests
+# ---------------------------------------------------------------------------
+
+def _make_empty_cache(batch_size, n_heads, max_len, head_dim):
+    """Create a zeroed KV-cache dict."""
+    return {
+        'key': jnp.zeros((batch_size, n_heads, max_len, head_dim)),
+        'value': jnp.zeros((batch_size, n_heads, max_len, head_dim)),
+        'index': jnp.array(0, dtype=jnp.int32),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Component: Causal Self-Attention KV-Cache
+# ---------------------------------------------------------------------------
+
+class TestCausalSelfAttentionKVCache:
+    """Tests for CausalSelfAttention with KV-cache."""
+
+    def test_cache_output_shape(self):
+        """Cached call should return (output, updated_cache) with correct shapes."""
+        model = CausalSelfAttention(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        B, T = 2, 8
+        head_dim = TEST_CONFIG.d_model // TEST_CONFIG.n_heads
+        max_len = TEST_CONFIG.max_seq_len
+
+        x = jax.random.normal(rng, (B, T, TEST_CONFIG.d_model))
+        params = model.init(rng, x)
+
+        cache = _make_empty_cache(B, TEST_CONFIG.n_heads, max_len, head_dim)
+        output, new_cache = model.apply(params, x, deterministic=True, cache=cache)
+
+        assert output.shape == (B, T, TEST_CONFIG.d_model), (
+            f"Expected output shape (2, 8, 64), got {output.shape}"
+        )
+        assert new_cache['key'].shape == (B, TEST_CONFIG.n_heads, max_len, head_dim)
+        assert new_cache['value'].shape == (B, TEST_CONFIG.n_heads, max_len, head_dim)
+        assert int(new_cache['index']) == T
+
+    def test_cache_matches_full_forward(self):
+        """Single-token cached decode should match full-sequence forward at that position."""
+        model = CausalSelfAttention(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        B = 1
+        seq_len = 6
+        head_dim = TEST_CONFIG.d_model // TEST_CONFIG.n_heads
+        max_len = TEST_CONFIG.max_seq_len
+
+        x = jax.random.normal(rng, (B, seq_len, TEST_CONFIG.d_model))
+        params = model.init(rng, x)
+
+        # Full forward pass
+        full_output = model.apply(params, x, deterministic=True)
+
+        # Cached: prefill all tokens at once, then check output matches
+        cache = _make_empty_cache(B, TEST_CONFIG.n_heads, max_len, head_dim)
+        cached_output, _ = model.apply(params, x, deterministic=True, cache=cache)
+
+        np.testing.assert_allclose(
+            full_output, cached_output, atol=1e-5,
+            err_msg="Prefill cached output should match full forward output",
+        )
+
+    def test_cache_prefill_then_decode(self):
+        """Prefill prompt tokens, then decode one token; verify outputs match full forward."""
+        model = CausalSelfAttention(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(1)
+        B = 1
+        prompt_len = 4
+        total_len = 6
+        head_dim = TEST_CONFIG.d_model // TEST_CONFIG.n_heads
+        max_len = TEST_CONFIG.max_seq_len
+
+        x = jax.random.normal(rng, (B, total_len, TEST_CONFIG.d_model))
+        params = model.init(rng, x)
+
+        # Full forward for reference
+        full_output = model.apply(params, x, deterministic=True)
+
+        # Step 1: prefill with prompt tokens
+        cache = _make_empty_cache(B, TEST_CONFIG.n_heads, max_len, head_dim)
+        prefill_out, cache = model.apply(
+            params, x[:, :prompt_len, :], deterministic=True, cache=cache,
+        )
+        np.testing.assert_allclose(
+            full_output[:, :prompt_len, :], prefill_out, atol=1e-5,
+            err_msg="Prefill output should match full forward for prompt positions",
+        )
+
+        # Step 2: decode remaining tokens one at a time
+        for i in range(prompt_len, total_len):
+            decode_out, cache = model.apply(
+                params, x[:, i:i+1, :], deterministic=True, cache=cache,
+            )
+            np.testing.assert_allclose(
+                full_output[:, i:i+1, :], decode_out, atol=1e-5,
+                err_msg=f"Decode output at position {i} should match full forward",
+            )
+
+    def test_backward_compatible(self):
+        """Calling without cache should return just the output tensor (not a tuple)."""
+        model = CausalSelfAttention(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        x = jax.random.normal(rng, (2, 8, TEST_CONFIG.d_model))
+
+        params = model.init(rng, x)
+        result = model.apply(params, x, deterministic=True)
+
+        # Should be a plain array, not a tuple
+        assert isinstance(result, jax.Array), (
+            f"Without cache, result should be jax.Array, got {type(result)}"
+        )
+        assert result.shape == (2, 8, TEST_CONFIG.d_model)
+
+
+# ---------------------------------------------------------------------------
 # Component: Transformer Block
 # ---------------------------------------------------------------------------
 
@@ -125,6 +242,83 @@ class TestTransformerBlock:
         params = block.init(rng, x, mask=mask)
         y = block.apply(params, x, mask=mask, deterministic=True)
         assert y.shape == (2, 8, 64)
+
+
+# ---------------------------------------------------------------------------
+# Component: Transformer Block KV-Cache
+# ---------------------------------------------------------------------------
+
+class TestTransformerBlockKVCache:
+    """Tests for TransformerBlock with KV-cache."""
+
+    def test_cache_passthrough_shape(self):
+        """Cached call should return (output, updated_cache) with correct shapes."""
+        block = TransformerBlock(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        B, T = 2, 8
+        head_dim = TEST_CONFIG.d_model // TEST_CONFIG.n_heads
+        max_len = TEST_CONFIG.max_seq_len
+
+        x = jax.random.normal(rng, (B, T, TEST_CONFIG.d_model))
+        params = block.init(rng, x)
+
+        cache = _make_empty_cache(B, TEST_CONFIG.n_heads, max_len, head_dim)
+        output, new_cache = block.apply(params, x, deterministic=True, cache=cache)
+
+        assert output.shape == (B, T, TEST_CONFIG.d_model)
+        assert new_cache['key'].shape == (B, TEST_CONFIG.n_heads, max_len, head_dim)
+        assert new_cache['value'].shape == (B, TEST_CONFIG.n_heads, max_len, head_dim)
+        assert int(new_cache['index']) == T
+
+    def test_cache_matches_full_forward(self):
+        """Prefill-then-decode with cache should match full forward at each position."""
+        block = TransformerBlock(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(1)
+        B = 1
+        prompt_len = 4
+        total_len = 6
+        head_dim = TEST_CONFIG.d_model // TEST_CONFIG.n_heads
+        max_len = TEST_CONFIG.max_seq_len
+
+        x = jax.random.normal(rng, (B, total_len, TEST_CONFIG.d_model))
+        params = block.init(rng, x)
+
+        # Full forward for reference
+        full_output = block.apply(params, x, deterministic=True)
+
+        # Step 1: prefill
+        cache = _make_empty_cache(B, TEST_CONFIG.n_heads, max_len, head_dim)
+        prefill_out, cache = block.apply(
+            params, x[:, :prompt_len, :], deterministic=True, cache=cache,
+        )
+        np.testing.assert_allclose(
+            full_output[:, :prompt_len, :], prefill_out, atol=1e-5,
+            err_msg="Block prefill output should match full forward",
+        )
+
+        # Step 2: decode one-by-one
+        for i in range(prompt_len, total_len):
+            decode_out, cache = block.apply(
+                params, x[:, i:i+1, :], deterministic=True, cache=cache,
+            )
+            np.testing.assert_allclose(
+                full_output[:, i:i+1, :], decode_out, atol=1e-5,
+                err_msg=f"Block decode output at position {i} should match full forward",
+            )
+
+    def test_backward_compatible(self):
+        """Without cache, TransformerBlock should return a plain tensor."""
+        block = TransformerBlock(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        x = jax.random.normal(rng, (2, 8, TEST_CONFIG.d_model))
+
+        params = block.init(rng, x)
+        result = block.apply(params, x, deterministic=True)
+
+        assert isinstance(result, jax.Array), (
+            f"Without cache, result should be jax.Array, got {type(result)}"
+        )
+        assert result.shape == (2, 8, TEST_CONFIG.d_model)
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +397,112 @@ class TestGPT2LMHeadModel:
         assert hidden.shape == (2, 16, TEST_CONFIG.d_model), (
             f"Expected (2, 16, {TEST_CONFIG.d_model}), got {hidden.shape}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Component: GPT-2 KV-Cache
+# ---------------------------------------------------------------------------
+
+class TestGPT2KVCache:
+    """Tests for GPT2LMHeadModel with KV-cache."""
+
+    def test_init_cache_shapes(self):
+        """init_cache should produce correct structure and shapes."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        B = 2
+        cache = model.init_cache(B)
+
+        head_dim = TEST_CONFIG.d_model // TEST_CONFIG.n_heads
+        assert len(cache) == TEST_CONFIG.n_layers, (
+            f"Expected {TEST_CONFIG.n_layers} layer caches, got {len(cache)}"
+        )
+        for i, lc in enumerate(cache):
+            assert lc['key'].shape == (B, TEST_CONFIG.n_heads, TEST_CONFIG.max_seq_len, head_dim), (
+                f"Layer {i} key shape mismatch"
+            )
+            assert lc['value'].shape == (B, TEST_CONFIG.n_heads, TEST_CONFIG.max_seq_len, head_dim), (
+                f"Layer {i} value shape mismatch"
+            )
+            assert int(lc['index']) == 0
+
+    def test_prefill_then_decode(self):
+        """Prefill prompt, decode one token — logits should match full forward."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        B = 1
+        prompt_len = 5
+        total_len = 6
+
+        input_ids = jax.random.randint(rng, (B, total_len), 0, TEST_CONFIG.vocab_size)
+        params = model.init(rng, input_ids)
+
+        # Full forward for reference
+        full_logits = model.apply(params, input_ids, deterministic=True)
+
+        # Prefill
+        cache = model.init_cache(B)
+        prefill_logits, cache = model.apply(
+            params, input_ids[:, :prompt_len], deterministic=True, cache=cache,
+        )
+        np.testing.assert_allclose(
+            full_logits[:, :prompt_len, :], prefill_logits, atol=1e-4,
+            err_msg="GPT2 prefill logits should match full forward",
+        )
+
+        # Decode one token
+        decode_logits, cache = model.apply(
+            params, input_ids[:, prompt_len:prompt_len+1], deterministic=True, cache=cache,
+        )
+        np.testing.assert_allclose(
+            full_logits[:, prompt_len:prompt_len+1, :], decode_logits, atol=1e-4,
+            err_msg="GPT2 decode logits should match full forward at decoded position",
+        )
+
+    def test_multi_step_decode(self):
+        """Prefill + decode N tokens one-by-one; each step should match full forward."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(2)
+        B = 2
+        prompt_len = 3
+        decode_steps = 5
+        total_len = prompt_len + decode_steps
+
+        input_ids = jax.random.randint(rng, (B, total_len), 0, TEST_CONFIG.vocab_size)
+        params = model.init(rng, input_ids)
+
+        # Full forward for reference
+        full_logits = model.apply(params, input_ids, deterministic=True)
+
+        # Prefill
+        cache = model.init_cache(B)
+        prefill_logits, cache = model.apply(
+            params, input_ids[:, :prompt_len], deterministic=True, cache=cache,
+        )
+        np.testing.assert_allclose(
+            full_logits[:, :prompt_len, :], prefill_logits, atol=1e-4,
+            err_msg="GPT2 multi-step prefill mismatch",
+        )
+
+        # Decode one token at a time
+        for i in range(prompt_len, total_len):
+            decode_logits, cache = model.apply(
+                params, input_ids[:, i:i+1], deterministic=True, cache=cache,
+            )
+            np.testing.assert_allclose(
+                full_logits[:, i:i+1, :], decode_logits, atol=1e-4,
+                err_msg=f"GPT2 decode step {i} logits mismatch",
+            )
+
+    def test_backward_compatible(self):
+        """Without cache, __call__ should still return a plain logits tensor."""
+        model = GPT2LMHeadModel(config=TEST_CONFIG)
+        rng = jax.random.PRNGKey(0)
+        input_ids = jnp.ones((2, 16), dtype=jnp.int32)
+
+        params = model.init(rng, input_ids)
+        result = model.apply(params, input_ids, deterministic=True)
+
+        assert isinstance(result, jax.Array), (
+            f"Without cache, result should be jax.Array, got {type(result)}"
+        )
+        assert result.shape == (2, 16, TEST_CONFIG.vocab_size)

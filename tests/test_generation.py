@@ -1,4 +1,5 @@
-"""Tests for generation utilities: top-k sampling, nucleus sampling, and generate.
+"""Tests for generation utilities: top-k sampling, nucleus sampling, generate,
+and generate_with_cache.
 
 Run with: pytest tests/test_generation.py -v
 """
@@ -8,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from utils.generation import top_k_sampling, nucleus_sampling, generate
+from utils.generation import top_k_sampling, nucleus_sampling, generate, generate_with_cache
 
 
 VOCAB_SIZE = 64
@@ -356,3 +357,203 @@ class TestGenerate:
 
         assert output.shape == (1, 7)
         np.testing.assert_array_equal(np.array(output[0, :3]), [1, 2, 3])
+
+
+# ---------------------------------------------------------------------------
+# Helpers for generate_with_cache tests
+# ---------------------------------------------------------------------------
+
+def _make_dummy_cached_apply_fn(vocab_size: int, deterministic_token: int | None = None):
+    """Create a dummy cached apply_fn for testing generate_with_cache.
+
+    Returns ``(logits, updated_cache)`` where logits are derived from the
+    input token values (same formula as ``_make_dummy_apply_fn``).
+    """
+    def apply_fn(params, input_ids, cache):
+        batch_size, seq_len = input_ids.shape
+        if deterministic_token is not None:
+            logits = jnp.zeros((batch_size, seq_len, vocab_size))
+            logits = logits.at[:, :, deterministic_token].set(10.0)
+        else:
+            logits = jnp.sin(
+                jnp.arange(vocab_size)[None, None, :]
+                + input_ids[:, :, None].astype(jnp.float32)
+            )
+        # Advance cache indices (simulate real cache update)
+        updated_cache = []
+        for lc in cache:
+            updated_cache.append({
+                'key': lc['key'],
+                'value': lc['value'],
+                'index': lc['index'] + seq_len,
+            })
+        return logits, updated_cache
+    return apply_fn
+
+
+def _make_dummy_init_cache_fn(max_seq_len: int = 64, n_layers: int = 2):
+    """Create a dummy init_cache_fn compatible with the dummy cached apply_fn."""
+    def init_cache_fn(batch_size):
+        return [{
+            'key': jnp.zeros((batch_size, 2, max_seq_len, 32)),
+            'value': jnp.zeros((batch_size, 2, max_seq_len, 32)),
+            'index': jnp.array(0, dtype=jnp.int32),
+        } for _ in range(n_layers)]
+    return init_cache_fn
+
+
+# ---------------------------------------------------------------------------
+# Component: Generate with KV-Cache
+# ---------------------------------------------------------------------------
+
+class TestGenerateWithCache:
+    """Tests for the KV-cache accelerated generate function."""
+
+    def test_output_shape(self):
+        """Output should be (batch, prompt_len + max_new_tokens)."""
+        batch_size, prompt_len, max_new_tokens = 2, 4, 8
+        input_ids = jnp.ones((batch_size, prompt_len), dtype=jnp.int32)
+        apply_fn = _make_dummy_cached_apply_fn(VOCAB_SIZE)
+        init_cache_fn = _make_dummy_init_cache_fn()
+
+        output = generate_with_cache(
+            apply_fn, None, input_ids, RNG, init_cache_fn,
+            max_new_tokens=max_new_tokens,
+        )
+
+        assert output.shape == (batch_size, prompt_len + max_new_tokens), (
+            f"Expected {(batch_size, prompt_len + max_new_tokens)}, got {output.shape}"
+        )
+
+    def test_prompt_preserved(self):
+        """The prompt tokens should appear unchanged at the start of the output."""
+        input_ids = jax.random.randint(RNG, (2, 5), 1, VOCAB_SIZE)
+        apply_fn = _make_dummy_cached_apply_fn(VOCAB_SIZE)
+        init_cache_fn = _make_dummy_init_cache_fn()
+
+        output = generate_with_cache(
+            apply_fn, None, input_ids, RNG, init_cache_fn,
+            max_new_tokens=6,
+        )
+
+        np.testing.assert_array_equal(
+            np.array(output[:, :5]),
+            np.array(input_ids),
+            err_msg="Prompt tokens should be preserved in output",
+        )
+
+    def test_deterministic(self):
+        """Same RNG should produce identical outputs."""
+        input_ids = jnp.ones((2, 3), dtype=jnp.int32)
+        apply_fn = _make_dummy_cached_apply_fn(VOCAB_SIZE)
+        init_cache_fn = _make_dummy_init_cache_fn()
+        rng = jax.random.PRNGKey(99)
+
+        out1 = generate_with_cache(
+            apply_fn, None, input_ids, rng, init_cache_fn, max_new_tokens=8,
+        )
+        out2 = generate_with_cache(
+            apply_fn, None, input_ids, rng, init_cache_fn, max_new_tokens=8,
+        )
+
+        np.testing.assert_array_equal(np.array(out1), np.array(out2))
+
+    def test_eos_stopping(self):
+        """When all sequences emit EOS, remaining positions should be padded with 0."""
+        eos_id = 2
+        input_ids = jnp.ones((1, 3), dtype=jnp.int32)
+        apply_fn = _make_dummy_cached_apply_fn(VOCAB_SIZE, deterministic_token=eos_id)
+        init_cache_fn = _make_dummy_init_cache_fn()
+
+        output = generate_with_cache(
+            apply_fn, None, input_ids, RNG, init_cache_fn,
+            max_new_tokens=10, temperature=0.01, top_k=10,
+            eos_token_id=eos_id,
+        )
+
+        generated = output[0, 3:]
+        assert int(generated[0]) == eos_id
+        np.testing.assert_array_equal(
+            np.array(generated[1:]),
+            np.zeros(9, dtype=np.int32),
+            err_msg="Positions after EOS should be padded with 0",
+        )
+
+    def test_per_sequence_eos(self):
+        """EOS should stop individual sequences, not the entire batch."""
+        eos_id = 5
+
+        def apply_fn(params, input_ids, cache):
+            batch_size, seq_len = input_ids.shape
+            logits = jnp.zeros((batch_size, seq_len, VOCAB_SIZE))
+            logits = logits.at[0, :, eos_id].set(10.0)
+            logits = logits.at[1, :, 10].set(10.0)
+            updated_cache = []
+            for lc in cache:
+                updated_cache.append({
+                    'key': lc['key'],
+                    'value': lc['value'],
+                    'index': lc['index'] + seq_len,
+                })
+            return logits, updated_cache
+
+        init_cache_fn = _make_dummy_init_cache_fn()
+        input_ids = jnp.ones((2, 3), dtype=jnp.int32)
+
+        output = generate_with_cache(
+            apply_fn, None, input_ids, RNG, init_cache_fn,
+            max_new_tokens=5, temperature=0.01, top_k=10,
+            eos_token_id=eos_id,
+        )
+
+        # Sequence 0: EOS then padding
+        assert int(output[0, 3]) == eos_id
+        np.testing.assert_array_equal(
+            np.array(output[0, 4:]),
+            np.zeros(4, dtype=np.int32),
+            err_msg="Seq 0 should be padded after EOS",
+        )
+
+        # Sequence 1: should keep generating token 10
+        np.testing.assert_array_equal(
+            np.array(output[1, 3:]),
+            np.full(5, 10, dtype=np.int32),
+            err_msg="Seq 1 should keep generating (no EOS)",
+        )
+
+    def test_matches_generate(self):
+        """generate_with_cache with a real GPT-2 model should produce identical
+        output to the non-cached generate function."""
+        from configs.model_config import ModelConfig
+        from models.gpt2 import GPT2LMHeadModel
+
+        cfg = ModelConfig(
+            vocab_size=VOCAB_SIZE, max_seq_len=32, n_layers=2, n_heads=2,
+            d_model=64, d_ff=256, dropout_rate=0.0,
+        )
+        model = GPT2LMHeadModel(config=cfg)
+        rng = jax.random.PRNGKey(42)
+        input_ids = jax.random.randint(rng, (2, 5), 0, VOCAB_SIZE)
+
+        params = model.init(rng, input_ids)
+
+        # Non-cached generate
+        plain_apply = lambda p, ids: model.apply(p, ids, deterministic=True)
+        out_plain = generate(
+            plain_apply, params, input_ids, rng,
+            max_new_tokens=10, temperature=0.7, top_k=10,
+        )
+
+        # Cached generate
+        cached_apply = lambda p, ids, cache: model.apply(
+            p, ids, deterministic=True, cache=cache,
+        )
+        out_cached = generate_with_cache(
+            cached_apply, params, input_ids, rng, model.init_cache,
+            max_new_tokens=10, temperature=0.7, top_k=10,
+        )
+
+        np.testing.assert_array_equal(
+            np.array(out_plain), np.array(out_cached),
+            err_msg="Cached generation should produce identical output to non-cached",
+        )
